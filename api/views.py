@@ -1,190 +1,372 @@
-import sys
-from pathlib import Path
-# Находим корень проекта и добавляем его на первое место в список путей Python
-BASE_DIR = Path(__file__).resolve().parent.parent
-if str(BASE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR))
+from __future__ import annotations
 
-from django.shortcuts import render
-
-# Create your views here.
-from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_http_methods
-from .models import Field, SoilReading, WeatherData, Alert, Prediction
-from .weather_service import get_current_weather, check_disaster_risk
-from ml.predictor import predict_moisture_7days, check_water_needed
 import json
+from typing import Any, Optional
 
-# ── ПОЛЯ ──────────────────────────────────────────────
+from django.conf import settings
+from django.http import HttpRequest, JsonResponse
+from django.views.decorators.csrf import csrf_exempt
 
-@csrf_exempt
-def field_list(request):
-    """GET /api/fields/ - список всех полей"""
-    # Получаем данные из базы и сразу превращаем в список словарей
-    fields = list(Field.objects.all().values(
-        'id', 'name', 'latitude', 'longitude',
-        'area_hectares', 'crop_type'
-    ))
+from ml.predictor import check_water_needed, predict_moisture_7days
 
-    # Если список пустой, добавляем тестовую точку
-    if not fields:
-        fields = [
-            {
-                "id": 999,
-                "name": "Тестовый сектор ApriSoil",
-                "latitude": 42.8746,   # Широта Бишкека
-                "longitude": 74.5698,  # Долгота Бишкека
-                "area_hectares": 12.5,
-                "crop_type": "Wheat"
-            }
-        ]
-
-    return JsonResponse({'fields': fields})
+from .models import Alert, Field, Prediction, SoilReading
+from .weather_service import check_disaster_risk, get_current_weather
 
 
-
-@csrf_exempt
-def field_create(request):
-    """POST /api/fields/create/ — добавить поле"""
-    if request.method == 'POST':
-        data = json.loads(request.body)
-        field = Field.objects.create(
-            name=data['name'],
-            latitude=data['latitude'],
-            longitude=data['longitude'],
-            area_hectares=data.get('area_hectares', 1.0),
-            crop_type=data.get('crop_type', 'apricot')
-        )
-        return JsonResponse({'id': field.id, 'name': field.name})
+def _error(message: str, status: int = 400, code: str = "bad_request") -> JsonResponse:
+    return JsonResponse({"error": message, "code": code}, status=status)
 
 
-# ── ДАТЧИКИ ───────────────────────────────────────────
+def _method_not_allowed(method: str) -> JsonResponse:
+    return _error(f"Method {method} is not allowed for this endpoint.", status=405, code="method_not_allowed")
 
-def soil_data(request, field_id):
-    """GET /api/fields//soil/ — данные почвы"""
+
+def _parse_json_body(request: HttpRequest) -> tuple[Optional[dict[str, Any]], Optional[JsonResponse]]:
+    if not request.body:
+        return {}, None
     try:
-        field = Field.objects.get(id=field_id)
+        payload = json.loads(request.body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, _error("Invalid JSON body.", status=400, code="invalid_json")
+    if not isinstance(payload, dict):
+        return None, _error("JSON body must be an object.", status=400, code="invalid_json")
+    return payload, None
+
+
+def _get_field(field_id: int) -> tuple[Optional[Field], Optional[JsonResponse]]:
+    try:
+        return Field.objects.get(id=field_id), None
     except Field.DoesNotExist:
-        return JsonResponse({'error': 'Поле не найдено'}, status=404)
+        return None, _error("Field not found.", status=404, code="field_not_found")
 
-    readings = SoilReading.objects.filter(
-        field=field
-    ).values(
-        'moisture','temperature','ph','timestamp'
-    )[:20]
 
-    last = readings.first() if readings else None
-    return JsonResponse({
-        'field': field.name,
-        'current': last,
-        'history': list(readings),
-    })
+def _read_string(
+    payload: dict[str, Any],
+    key: str,
+    *,
+    default: Optional[str] = None,
+    required: bool = False,
+    max_length: int = 100,
+) -> tuple[Optional[str], Optional[str]]:
+    value = payload.get(key, default)
+    if value is None:
+        if required:
+            return None, f"{key} is required."
+        return default, None
+    if not isinstance(value, str):
+        return None, f"{key} must be a string."
+    value = value.strip()
+    if required and not value:
+        return None, f"{key} is required."
+    if len(value) > max_length:
+        return None, f"{key} must be at most {max_length} characters."
+    return value, None
+
+
+def _read_number(
+    payload: dict[str, Any],
+    key: str,
+    *,
+    default: Optional[float] = None,
+    required: bool = False,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> tuple[Optional[float], Optional[str]]:
+    value = payload.get(key, default)
+    if value is None:
+        if required:
+            return None, f"{key} is required."
+        return default, None
+    if isinstance(value, bool):
+        return None, f"{key} must be a number."
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None, f"{key} must be a number."
+    if minimum is not None and number < minimum:
+        return None, f"{key} must be greater than or equal to {minimum}."
+    if maximum is not None and number > maximum:
+        return None, f"{key} must be less than or equal to {maximum}."
+    return number, None
+
+
+def _validation_error(message: Optional[str]) -> Optional[JsonResponse]:
+    if message is None:
+        return None
+    return _error(message, status=400, code="validation_error")
+
+
+def _field_payload(field: Field) -> dict[str, Any]:
+    return {
+        "id": field.id,
+        "name": field.name,
+        "latitude": field.latitude,
+        "longitude": field.longitude,
+        "area_hectares": field.area_hectares,
+        "crop_type": field.crop_type,
+    }
+
+
+def _ensure_development_field() -> None:
+    if not settings.DEBUG or Field.objects.exists():
+        return
+    Field.objects.get_or_create(
+        name="Тестовый сектор ApriSoil",
+        defaults={
+            "latitude": 42.8746,
+            "longitude": 74.5698,
+            "area_hectares": 12.5,
+            "crop_type": "apricot",
+        },
+    )
 
 
 @csrf_exempt
-def soil_add(request, field_id):
-    """POST /api/fields//soil/add/ — добавить показание"""
-    if request.method == 'POST':
-        data = json.loads(request.body)
-        field = Field.objects.get(id=field_id)
-        reading = SoilReading.objects.create(
+def field_list(request: HttpRequest) -> JsonResponse:
+    if request.method != "GET":
+        return _method_not_allowed(request.method)
+
+    _ensure_development_field()
+    fields = [_field_payload(field) for field in Field.objects.all().order_by("id")]
+    return JsonResponse({"fields": fields})
+
+
+@csrf_exempt
+def field_create(request: HttpRequest) -> JsonResponse:
+    if request.method != "POST":
+        return _method_not_allowed(request.method)
+
+    payload, error_response = _parse_json_body(request)
+    if error_response is not None:
+        return error_response
+    assert payload is not None
+
+    name, error = _read_string(payload, "name", required=True, max_length=100)
+    if (response := _validation_error(error)) is not None:
+        return response
+    latitude, error = _read_number(payload, "latitude", required=True, minimum=-90, maximum=90)
+    if (response := _validation_error(error)) is not None:
+        return response
+    longitude, error = _read_number(payload, "longitude", required=True, minimum=-180, maximum=180)
+    if (response := _validation_error(error)) is not None:
+        return response
+    area, error = _read_number(payload, "area_hectares", default=1.0, minimum=0.01)
+    if (response := _validation_error(error)) is not None:
+        return response
+    crop_type, error = _read_string(payload, "crop_type", default="apricot", max_length=50)
+    if (response := _validation_error(error)) is not None:
+        return response
+
+    field = Field.objects.create(
+        name=name if name is not None else "",
+        latitude=latitude if latitude is not None else 0.0,
+        longitude=longitude if longitude is not None else 0.0,
+        area_hectares=area if area is not None else 1.0,
+        crop_type=crop_type if crop_type is not None else "apricot",
+    )
+    return JsonResponse({"field": _field_payload(field), "id": field.id, "name": field.name}, status=201)
+
+
+def soil_data(request: HttpRequest, field_id: int) -> JsonResponse:
+    if request.method != "GET":
+        return _method_not_allowed(request.method)
+
+    field, error_response = _get_field(field_id)
+    if error_response is not None:
+        return error_response
+    assert field is not None
+
+    readings = list(
+        SoilReading.objects.filter(field=field)
+        .order_by("-timestamp")
+        .values("id", "moisture", "temperature", "ph", "depth", "nitrogen", "timestamp")[:20]
+    )
+    return JsonResponse(
+        {
+            "field": field.name,
+            "field_id": field.id,
+            "current": readings[0] if readings else None,
+            "history": readings,
+        }
+    )
+
+
+@csrf_exempt
+def soil_add(request: HttpRequest, field_id: int) -> JsonResponse:
+    if request.method != "POST":
+        return _method_not_allowed(request.method)
+
+    field, error_response = _get_field(field_id)
+    if error_response is not None:
+        return error_response
+    assert field is not None
+
+    payload, error_response = _parse_json_body(request)
+    if error_response is not None:
+        return error_response
+    assert payload is not None
+
+    moisture, error = _read_number(payload, "moisture", required=True, minimum=0, maximum=100)
+    if (response := _validation_error(error)) is not None:
+        return response
+    temperature, error = _read_number(payload, "temperature", required=True, minimum=-50, maximum=80)
+    if (response := _validation_error(error)) is not None:
+        return response
+    ph, error = _read_number(payload, "ph", default=6.5, minimum=0, maximum=14)
+    if (response := _validation_error(error)) is not None:
+        return response
+    depth, error = _read_number(payload, "depth", default=0.3, minimum=0, maximum=10)
+    if (response := _validation_error(error)) is not None:
+        return response
+    nitrogen, error = _read_number(payload, "nitrogen", default=None, minimum=0, maximum=10000)
+    if (response := _validation_error(error)) is not None:
+        return response
+
+    reading = SoilReading.objects.create(
+        field=field,
+        moisture=moisture if moisture is not None else 0.0,
+        temperature=temperature if temperature is not None else 0.0,
+        ph=ph if ph is not None else 6.5,
+        depth=depth if depth is not None else 0.3,
+        nitrogen=nitrogen,
+    )
+    return JsonResponse(
+        {
+            "status": "ok",
+            "id": reading.id,
+            "reading": {
+                "id": reading.id,
+                "moisture": reading.moisture,
+                "temperature": reading.temperature,
+                "ph": reading.ph,
+                "depth": reading.depth,
+                "nitrogen": reading.nitrogen,
+                "timestamp": reading.timestamp,
+            },
+        },
+        status=201,
+    )
+
+
+def _save_prediction(field: Field, forecast_data: list[dict[str, Any]], days_to_water: Optional[int]) -> None:
+    prediction = Prediction.objects.filter(field=field).order_by("-created_at").first()
+    if prediction is None:
+        Prediction.objects.create(
             field=field,
-            moisture=data['moisture'],
-            temperature=data['temperature'],
-            ph=data.get('ph', 6.5),
+            forecast_json=forecast_data,
+            days_until_water=days_to_water,
         )
-        return JsonResponse({'status': 'ok', 'id': reading.id})
+        return
+
+    Prediction.objects.filter(field=field).exclude(id=prediction.id).delete()
+    prediction.forecast_json = forecast_data
+    prediction.days_until_water = days_to_water
+    prediction.save(update_fields=["forecast_json", "days_until_water"])
 
 
-# ── ПРОГНОЗ PINN ──────────────────────────────────────
+def forecast(request: HttpRequest, field_id: int) -> JsonResponse:
+    if request.method != "GET":
+        return _method_not_allowed(request.method)
 
-def forecast(request, field_id):
-    """GET /api/fields//forecast/ — прогноз PINN"""
-    try:
-        field = Field.objects.get(id=field_id)
-    except Field.DoesNotExist:
-        return JsonResponse({'error': 'Поле не найдено'}, status=404)
+    field, error_response = _get_field(field_id)
+    if error_response is not None:
+        return error_response
+    assert field is not None
 
-    last_reading = SoilReading.objects.filter(field=field).first()
+    last_reading = SoilReading.objects.filter(field=field).order_by("-timestamp").first()
     current_moisture = last_reading.moisture if last_reading else 40.0
     current_temp = last_reading.temperature if last_reading else 25.0
 
     moisture_forecast = predict_moisture_7days(current_moisture, current_temp)
     days_to_water = check_water_needed(moisture_forecast)
-
     forecast_data = [
-        {
-            'day': i + 1,
-            'moisture': val,
-            'needs_water': val < 30,
-        }
-        for i, val in enumerate(moisture_forecast)
+        {"day": index + 1, "moisture": value, "needs_water": value < 30}
+        for index, value in enumerate(moisture_forecast)
     ]
 
+    _save_prediction(field, forecast_data, days_to_water)
+
     recommendation = (
-        f'Полив нужен через {days_to_water} дн.'
-        if days_to_water else 'Состояние нормальное'
+        f"Полив нужен через {days_to_water} дн."
+        if days_to_water
+        else "Состояние нормальное"
+    )
+    return JsonResponse(
+        {
+            "field": field.name,
+            "field_id": field.id,
+            "current_moisture": round(current_moisture, 1),
+            "forecast": forecast_data,
+            "recommendation": recommendation,
+            "days_until_water": days_to_water,
+        }
     )
 
-    # Сохраняем прогноз в БД
-    Prediction.objects.create(
-        field=field,
-        forecast_json=forecast_data,
-        days_until_water=days_to_water
-    )
 
-    return JsonResponse({
-        'field': field.name,
-        'current_moisture': round(current_moisture, 1),
-        'forecast': forecast_data,
-        'recommendation': recommendation,
-        'days_until_water': days_to_water,
-    })
+def weather(request: HttpRequest, field_id: int) -> JsonResponse:
+    if request.method != "GET":
+        return _method_not_allowed(request.method)
 
+    field, error_response = _get_field(field_id)
+    if error_response is not None:
+        return error_response
+    assert field is not None
 
-# ── ПОГОДА И АЛЕРТЫ ───────────────────────────────────
-
-def weather(request, field_id):
-    """GET /api/fields//weather/ — погода"""
-    field = Field.objects.get(id=field_id)
     current = get_current_weather(field.latitude, field.longitude)
-    return JsonResponse({'field': field.name, 'weather': current})
+    return JsonResponse({"field": field.name, "field_id": field.id, "weather": current})
 
 
-def alerts(request, field_id):
-    """GET /api/fields//alerts/ — все уведомления"""
-    field = Field.objects.get(id=field_id)
-
-    # Проверяем стихийные явления
-    disaster_alerts = check_disaster_risk(field.latitude, field.longitude)
-    for a in disaster_alerts:
-        Alert.objects.get_or_create(
+def _upsert_alert(field: Field, alert_type: str, level: str, message: str) -> None:
+    alerts = list(Alert.objects.filter(field=field, alert_type=alert_type).order_by("id"))
+    if not alerts:
+        Alert.objects.create(
             field=field,
-            alert_type=a['type'],
-            level=a['level'],
-            defaults={'message': a['message'], 'is_active': True}
+            alert_type=alert_type,
+            level=level,
+            message=message,
+            is_active=True,
         )
+        return
 
-    # Проверяем влажность
-    last = SoilReading.objects.filter(field=field).first()
+    keep = alerts[0]
+    keep.level = level
+    keep.message = message
+    keep.is_active = True
+    keep.save(update_fields=["level", "message", "is_active"])
+    Alert.objects.filter(field=field, alert_type=alert_type).exclude(id=keep.id).update(is_active=False)
+
+
+def alerts(request: HttpRequest, field_id: int) -> JsonResponse:
+    if request.method != "GET":
+        return _method_not_allowed(request.method)
+
+    field, error_response = _get_field(field_id)
+    if error_response is not None:
+        return error_response
+    assert field is not None
+
+    active_alert_types: set[str] = set()
+    for alert in check_disaster_risk(field.latitude, field.longitude):
+        alert_type = str(alert["type"])
+        active_alert_types.add(alert_type)
+        _upsert_alert(field, alert_type, str(alert["level"]), str(alert["message"]))
+
+    last = SoilReading.objects.filter(field=field).order_by("-timestamp").first()
     if last and last.moisture < 30:
-        Alert.objects.get_or_create(
-            field=field,
-            alert_type='water',
-            level='high',
-            defaults={
-                'message': f'Влажность {round(last.moisture,1)}% — нужен полив',
-                'is_active': True
-            }
+        active_alert_types.add("water")
+        _upsert_alert(
+            field,
+            "water",
+            "high",
+            f"Влажность {round(last.moisture, 1)}% — нужен полив",
         )
 
-    all_alerts = Alert.objects.filter(
-        field=field, is_active=True
-    ).values('alert_type','level','message','created_at')
+    managed_types = {"water", "hail", "flood"}
+    Alert.objects.filter(field=field, alert_type__in=managed_types - active_alert_types).update(is_active=False)
+    all_alerts = list(
+        Alert.objects.filter(field=field, is_active=True)
+        .order_by("-created_at")
+        .values("alert_type", "level", "message", "created_at")
+    )
 
-    return JsonResponse({
-        'field': field.name,
-        'alerts': list(all_alerts),
-        'count': all_alerts.count()
-    })
+    return JsonResponse({"field": field.name, "field_id": field.id, "alerts": all_alerts, "count": len(all_alerts)})

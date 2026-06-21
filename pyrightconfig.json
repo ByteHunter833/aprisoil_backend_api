@@ -1,0 +1,16 @@
+{
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "off",
+  "venvPath": ".",
+  "venv": ".venv",
+  "extraPaths": [
+    ".venv/lib/python3.12/site-packages"
+  ],
+  "reportMissingImports": false,
+  "reportMissingModuleSource": false,
+  "exclude": [
+    ".venv",
+    "**/migrations",
+    "**/__pycache__"
+  ]
+}
